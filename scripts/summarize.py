@@ -83,6 +83,46 @@ def find_rewards(root: Path) -> dict[str, dict]:
 RATIO_KEYS = ["reward", "f2p", "p2p", "partial"]
 COUNT_KEYS = ["f2p_passed", "f2p_total", "p2p_passed", "p2p_total"]
 
+# 这些异常算“模型没做出来”（超时 / 上下文耗尽），按官方 leaderboard 口径计入分母
+COUNTED_FAILURES = {
+    "AgentTimeoutError",
+    "VerifierTimeoutError",
+    "ContextWindowExceededError",
+    "ContextLengthExceededError",
+    "RewardFileNotFoundError",
+    "RewardFileEmptyError",
+    "VerifierOutputParseError",
+}
+
+
+def find_exceptions(root: Path) -> dict[str, set[str]]:
+    """task -> 该题出现过的异常类名集合（从 pier 的 trial result.json 里挖）。"""
+    known = expected_tasks()
+    out: dict[str, set[str]] = {}
+    for path in sorted(root.rglob("result.json")):
+        if "oracle" in str(path):
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        found: set[str] = set()
+
+        def walk(node) -> None:
+            if isinstance(node, dict):
+                if isinstance(node.get("exception_type"), str):
+                    found.add(node["exception_type"])
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(data)
+        if found:
+            out.setdefault(_task_from_path(path, known), set()).update(found)
+    return out
+
 
 def numeric_only(d: dict) -> dict[str, float]:
     return {
@@ -120,10 +160,28 @@ def main() -> int:
     score = 100.0 * sum(d.get("reward", 0.0) for _, d in rows) / total if total else 0.0
     missing = [t for t, d in rows if not d]
 
+    # 官方 leaderboard 口径：基础设施错误移出分母，超时/上下文耗尽算失败
+    exceptions = find_exceptions(root)
+    counted, excluded = [], []
+    for task, d in rows:
+        if d:
+            counted.append(d.get("reward", 0.0))
+        elif exceptions.get(task) and not (exceptions[task] & COUNTED_FAILURES):
+            excluded.append(task)  # 纯基础设施错误，不计入
+        else:
+            counted.append(0.0)  # 超时/上下文耗尽/无信息：算失败
+    score_official = 100.0 * sum(counted) / len(counted) if counted else 0.0
+
     print("# DeepSWE-mini 评测结果\n")
     print(f"- 任务数：**{total}**（期望 {len(tasks) or total}）")
     print(f"- 解出（binary reward=1）：**{solved}/{total}**")
-    print(f"- **DeepSWE-mini score（reward 均值）：{score:.1f}**")
+    print(f"- **DeepSWE-mini score（缺失计 0）：{score:.1f}**")
+    print(
+        f"- **DeepSWE-mini score（官方口径，基础设施错误移出分母）：{score_official:.1f}**"
+        f"（分母 {len(counted)}/{total}）"
+    )
+    if excluded:
+        print(f"- 基础设施错误（已移出分母）：{', '.join(excluded)}")
     for k in keys[1:]:
         avg = 100.0 * sum(d.get(k, 0.0) for _, d in rows) / total if total else 0.0
         print(f"- 均值 {k}：{avg:.1f}")
@@ -143,7 +201,11 @@ def main() -> int:
             )
         )
     if missing:
-        print(f"- ⚠️ 缺失/失败（按 0 计）：{', '.join(missing)}")
+        print(f"- ⚠️ 无 reward（按上面的规则处理）：{', '.join(missing)}")
+    if exceptions:
+        print("\n异常明细：")
+        for task in sorted(exceptions):
+            print(f"- `{task}`：{', '.join(sorted(exceptions[task]))}")
     print()
 
     header = "| task | " + " | ".join(keys) + " |"

@@ -166,7 +166,7 @@ jobs:
           HOSTED_VLLM_API_KEY: ${{ secrets.LLMROUTER_API_KEY }}
           API_BASE: ${{ inputs.api_base }}
         run: |
-          # --agent-env 必须是 KEY=VALUE（pier 的 parse_env_vars 会校验）
+          # 第一层容错：模型调用重试次数（默认 10，提到 20 以拉长抗抖窗口）
           .venv/bin/pier run -p "deep-swe/tasks/${{ matrix.task }}" \
             --agent mini-swe-agent \
             --model "${{ inputs.model_name }}" \
@@ -176,7 +176,9 @@ jobs:
             --ae "OPENAI_API_KEY=$OPENAI_API_KEY" \
             --ae "HOSTED_VLLM_API_KEY=$HOSTED_VLLM_API_KEY" \
             --ae "OPENAI_BASE_URL=$API_BASE" \
-            --env docker -y -n 1 -r 1 \
+            --ae "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT=20" \
+            --ae "MSWEA_COST_TRACKING=ignore_errors" \
+            --env docker -y -n 1 -r 2 \
             --agent-timeout-multiplier ${{ inputs.agent_timeout_multiplier }} \
             -o jobs
 
@@ -202,6 +204,7 @@ jobs:
             jobs/**/verifier/ctrf.json
             jobs/**/verifier/test-stdout.txt
             jobs/**/agent/mini-swe-agent.txt
+            jobs/**/result.json
             jobs-oracle/**/verifier/reward.json
 
   aggregate:
