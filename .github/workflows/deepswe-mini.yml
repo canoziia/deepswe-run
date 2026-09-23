@@ -7,10 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       task_set:
-        description: "mini16=全跑；smoke=只跑矩阵里第一个任务"
+        description: "mini16=全跑；smoke=只跑矩阵第一个任务；single=只跑 only_task 指定的那一题"
         type: choice
-        options: [mini16, smoke]
+        options: [mini16, smoke, single]
         default: mini16
+      only_task:
+        description: "task_set=single 时生效：要单独重跑的 task 名（必须存在于矩阵里）"
+        default: ""
       oracle_first:
         description: "先用 oracle agent（参考解）验证管道"
         type: boolean
@@ -70,12 +73,22 @@ jobs:
       - id: select
         name: 选择本 job 是否执行
         run: |
-          if [ "${{ inputs.task_set }}" = "smoke" ] && [ "${{ matrix.task }}" != "$SMOKE_TASK" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "smoke 模式：跳过 ${{ matrix.task }}"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          RUN=true
+          if [ "${{ inputs.task_set }}" = "smoke" ]; then
+            if [ "${{ matrix.task }}" != "$SMOKE_TASK" ]; then RUN=false; fi
           fi
+          if [ "${{ inputs.task_set }}" = "single" ]; then
+            if [ "${{ matrix.task }}" != "${{ inputs.only_task }}" ]; then RUN=false; fi
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "本 job: ${{ matrix.task }} → run=$RUN"
+
+      - name: 启动资源看门狗
+        if: steps.select.outputs.run == 'true'
+        run: |
+          # 每 60s 记录磁盘/内存/docker 占用；runner 掛掉时看这里就知原因
+          nohup setsid bash -c 'while true; do echo "===== $(date -u +%H:%M:%S)"; df -h / | tail -1; free -m | sed -n 2,3p; docker system df --format "{{.Type}} {{.Size}}" 2>/dev/null | tr "\n" " "; echo; sleep 60; done' > /tmp/watchdog.log 2>&1 &
+          sleep 2; head -5 /tmp/watchdog.log
 
       - name: 释放磁盘空间
         if: steps.select.outputs.run == 'true'
@@ -166,7 +179,8 @@ jobs:
           HOSTED_VLLM_API_KEY: ${{ secrets.LLMROUTER_API_KEY }}
           API_BASE: ${{ inputs.api_base }}
         run: |
-          # 第一层容错：模型调用重试次数（默认 10，提到 20 以拉长抗抖窗口）
+          docker system prune -af >/dev/null 2>&1 || true
+          # --agent-env 必须是 KEY=VALUE（pier 的 parse_env_vars 会校验）
           .venv/bin/pier run -p "deep-swe/tasks/${{ matrix.task }}" \
             --agent mini-swe-agent \
             --model "${{ inputs.model_name }}" \
@@ -185,6 +199,8 @@ jobs:
       - name: 单任务汇总
         if: always() && steps.select.outputs.run == 'true'
         run: |
+          echo "=== 资源看门狗（最后 30 条）==="
+          tail -30 /tmp/watchdog.log 2>/dev/null || echo "(无 watchdog 日志)"
           echo "=== reward.json ==="
           find jobs jobs-oracle -path '*/verifier/reward.json' -exec sh -c 'echo "--- $1"; cat "$1"; echo' _ {} \; 2>/dev/null || true
           echo "=== ctrf summary ==="
