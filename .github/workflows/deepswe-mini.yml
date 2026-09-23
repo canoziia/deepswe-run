@@ -1,0 +1,213 @@
+name: DeepSWE-mini eval (qwen3.8-flash-next · LLMRouter)
+
+# 一个 job = 一个任务：绕开 6h/job 上限与 runner 磁盘限制。
+# 官方口径：pier + mini-swe-agent(pinned) + temp1.0/top_p0.95/top_k20 + 256K ctx。
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_set:
+        description: "mini16=全跑；smoke=只跑矩阵里第一个任务"
+        type: choice
+        options: [mini16, smoke]
+        default: mini16
+      oracle_first:
+        description: "先用 oracle agent（参考解）验证管道"
+        type: boolean
+        default: true
+      max_parallel:
+        description: "并行 job 数（后端只有 2 卡，建议 4）"
+        default: "4"
+      model_name:
+        description: "传给 pier 的模型名"
+        default: hosted_vllm/qwen3.8-flash-next
+      api_base:
+        description: "OpenAI 兼容 base_url"
+        default: https://llmrouter.projectk.org/v1
+      mini_swe_agent_version:
+        description: "pinned harness 版本（leaderboard = 2.3.0）"
+        default: "2.3.0"
+      agent_timeout_multiplier:
+        description: "agent 超时倍数（官方 3h；1.0=严格官方口径）"
+        default: "1.0"
+
+permissions:
+  contents: read
+
+env:
+  # 任务集固定到 commit，保证可复现
+  DEEP_SWE_REPO: datacurve-ai/deep-swe
+  DEEP_SWE_COMMIT: 0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea
+  PIER_VERSION: "0.3.1"
+  SMOKE_TASK: aiomonitor-task-snapshots-diff
+
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix:
+        task:
+          - aiomonitor-task-snapshots-diff
+          - bandit-structured-nosec-directives
+          - dasel-html-document-format
+          - dynamodb-toolbox-lazy-recursive-schemas
+          - expr-try-catch-errors
+          - ipython-session-bundle-replay
+          - koota-composite-trait-aspects
+          - narwhals-rolling-window-suite
+          - ofetch-per-origin-circuit-breaker
+          - prometheus-transactional-reload-status
+          - prometheus-typed-label-sorting
+          - scc-bounded-memory-spilling
+          - termenv-preserve-ansi-resets
+          - textual-kitty-key-phases
+          - valibot-recursive-schema-composition
+          - yaegi-go-embed-directives
+    steps:
+      - id: select
+        name: 选择本 job 是否执行
+        run: |
+          if [ "${{ inputs.task_set }}" = "smoke" ] && [ "${{ matrix.task }}" != "$SMOKE_TASK" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "smoke 模式：跳过 ${{ matrix.task }}"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 释放磁盘空间
+        if: steps.select.outputs.run == 'true'
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          android: "true"
+          dotnet: "true"
+          haskell: "true"
+          large-packages: "true"
+          docker-images: "true"
+          preinstalled-runtimes: "true"   # 会删掉预装 Python，下面 setup-python 重新装
+          swap-storage: "false"           # 关掉，避免内存压力下被 kill
+
+      - name: 磁盘与运行时自检
+        if: steps.select.outputs.run == 'true'
+        run: |
+          df -h /
+          docker version
+          docker compose version
+          echo "--- 连通性 ---"
+          curl -s -o /dev/null -w "ecr=%{http_code}\n" https://public.ecr.aws/v2/ || true
+          curl -s -o /dev/null -w "pypi=%{http_code}\n" https://pypi.org/simple/ || true
+          curl -s -o /dev/null -w "astral=%{http_code}\n" https://astral.sh || true
+          curl -s -o /dev/null -w "llmrouter=%{http_code}\n" \
+            -H "Authorization: Bearer ${{ secrets.LLMROUTER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            "${{ inputs.api_base }}/models" || true
+          # llmrouter 期望 200；若 000/403，runner 出网有问题，需要换 runner
+
+      - name: 取任务集（固定 commit）
+        if: steps.select.outputs.run == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.DEEP_SWE_REPO }}
+          ref: ${{ env.DEEP_SWE_COMMIT }}
+          path: deep-swe
+
+      - uses: actions/setup-python@v6
+        if: steps.select.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Pier
+        if: steps.select.outputs.run == 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q -U pip
+          .venv/bin/pip install -q "datacurve-pier==$PIER_VERSION"
+          .venv/bin/pier --version
+
+      - name: 生成 mini-swe-agent 配置
+        if: steps.select.outputs.run == 'true'
+        env:
+          MODEL_NAME: ${{ inputs.model_name }}
+          API_BASE: ${{ inputs.api_base }}
+        run: |
+          cat > mswea-qwen.yaml <<YAML
+          model_class: litellm
+          model_name: ${MODEL_NAME}
+          model_kwargs:
+            api_base: ${API_BASE}
+            temperature: 1.0
+            top_p: 0.95
+            top_k: 20
+            max_tokens: 32768
+          YAML
+          sed -n '1,20p' mswea-qwen.yaml
+
+      - name: Oracle 预检（参考解，必须 reward=1）
+        if: steps.select.outputs.run == 'true' && inputs.oracle_first && matrix.task == 'aiomonitor-task-snapshots-diff'
+        continue-on-error: true
+        run: |
+          .venv/bin/pier run -p "deep-swe/tasks/${{ matrix.task }}" \
+            --agent oracle --env docker -y -q -o jobs-oracle
+          echo "--- oracle reward ---"
+          find jobs-oracle -path '*/verifier/reward.json' -exec cat {} \; || echo "no reward.json"
+
+      - name: 评测（mini-swe-agent）
+        if: steps.select.outputs.run == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.LLMROUTER_API_KEY }}
+          HOSTED_VLLM_API_KEY: ${{ secrets.LLMROUTER_API_KEY }}
+          API_BASE: ${{ inputs.api_base }}
+        run: |
+          .venv/bin/pier run -p "deep-swe/tasks/${{ matrix.task }}" \
+            --agent mini-swe-agent \
+            --model "${{ inputs.model_name }}" \
+            --ak version=${{ inputs.mini_swe_agent_version }} \
+            --ak config_file="$PWD/mswea-qwen.yaml" \
+            --ae OPENAI_API_KEY \
+            --ae HOSTED_VLLM_API_KEY \
+            --ae OPENAI_BASE_URL="$API_BASE" \
+            --env docker -y -n 1 -r 1 \
+            --agent-timeout-multiplier ${{ inputs.agent_timeout_multiplier }} \
+            -o jobs
+
+      - name: 单任务汇总
+        if: always() && steps.select.outputs.run == 'true'
+        run: |
+          echo "=== reward.json ==="
+          find jobs jobs-oracle -path '*/verifier/reward.json' -exec sh -c 'echo "--- $1"; cat "$1"; echo' _ {} \; 2>/dev/null || true
+          echo "=== ctrf summary ==="
+          find jobs -name ctrf.json -exec sh -c 'echo "--- $1"; head -c 400 "$1"; echo' _ {} \; 2>/dev/null || true
+          echo "=== agent log tail ==="
+          find jobs -name 'mini-swe-agent.txt' -exec tail -n 30 {} \; 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.select.outputs.run == 'true'
+        with:
+          name: deepswe-${{ matrix.task }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            jobs/**/verifier/reward.json
+            jobs/**/verifier/reward.txt
+            jobs/**/verifier/ctrf.json
+            jobs/**/verifier/test-stdout.txt
+            jobs/**/agent/mini-swe-agent.txt
+            jobs-oracle/**/verifier/reward.json
+
+  aggregate:
+    needs: eval
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: deepswe-*
+          merge-multiple: false
+      - name: 汇总成表
+        run: |
+          python3 scripts/summarize.py artifacts >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
