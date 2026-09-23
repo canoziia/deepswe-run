@@ -28,19 +28,35 @@ def expected_tasks() -> list[str]:
     return []
 
 
+def _task_from_path(path: Path, known: list[str]) -> str:
+    """从 artifact 目录名里找出任务名。
+
+    兼容三种布局：
+      artifacts/deepswe-<task>/...          （upload-artifact 的命名）
+      artifacts/<task>/...
+      artifacts/<run>/<task>/...
+    否则退回倒数第二级目录名。
+    """
+    for parent in path.parents:
+        name = parent.name
+        if name in known:
+            return name
+        if name.startswith("deepswe-") and name[len("deepswe-") :] in known:
+            return name[len("deepswe-") :]
+    for parent in path.parents:
+        if parent.name.startswith("deepswe-"):
+            return parent.name[len("deepswe-") :]
+    return path.parents[1].name
+
+
 def find_rewards(root: Path) -> dict[str, dict]:
     """task -> reward dict（同题多条时取最后一个）"""
+    known = expected_tasks()
     out: dict[str, dict] = {}
     for path in sorted(root.rglob("verifier/reward.json")):
-        task = None
-        for parent in path.parents:
-            if parent.name.startswith("deepswe-"):
-                task = parent.name[len("deepswe-") :]
-                break
-        if task is None:
-            task = path.parents[1].name
         if "oracle" in str(path):  # oracle 预检不算分
             continue
+        task = _task_from_path(path, known)
         try:
             data = json.loads(path.read_text())
         except Exception as exc:  # noqa: BLE001
@@ -54,18 +70,18 @@ def find_rewards(root: Path) -> dict[str, dict]:
     for path in sorted(root.rglob("verifier/reward.txt")):
         if "oracle" in str(path):
             continue
-        task = None
-        for parent in path.parents:
-            if parent.name.startswith("deepswe-"):
-                task = parent.name[len("deepswe-") :]
-                break
-        if task is None or task in out:
+        task = _task_from_path(path, known)
+        if task in out:
             continue
         try:
             out[task] = {"reward": float(path.read_text().strip())}
         except Exception:  # noqa: BLE001
             pass
     return out
+
+
+RATIO_KEYS = ["reward", "f2p", "p2p", "partial"]
+COUNT_KEYS = ["f2p_passed", "f2p_total", "p2p_passed", "p2p_total"]
 
 
 def numeric_only(d: dict) -> dict[str, float]:
@@ -88,7 +104,7 @@ def main() -> int:
     keys: list[str] = []
     for d in rewards.values():
         for k in numeric_only(d):
-            if k not in keys:
+            if k in RATIO_KEYS and k not in keys:
                 keys.append(k)
     if "reward" in keys:
         keys.remove("reward")
@@ -111,6 +127,21 @@ def main() -> int:
     for k in keys[1:]:
         avg = 100.0 * sum(d.get(k, 0.0) for _, d in rows) / total if total else 0.0
         print(f"- 均值 {k}：{avg:.1f}")
+    counts = {k: 0.0 for k in COUNT_KEYS}
+    for _, d in rows:
+        for k in COUNT_KEYS:
+            if k in d:
+                counts[k] += d[k]
+    if any(counts.values()):
+        print(
+            "- 测试用例累计：f2p %g/%g，p2p %g/%g"
+            % (
+                counts["f2p_passed"],
+                counts["f2p_total"],
+                counts["p2p_passed"],
+                counts["p2p_total"],
+            )
+        )
     if missing:
         print(f"- ⚠️ 缺失/失败（按 0 计）：{', '.join(missing)}")
     print()
@@ -125,8 +156,16 @@ def main() -> int:
         cells = []
         for k in keys:
             v = d.get(k)
-            cells.append("—" if v is None else (f"{v:.0f}" if k == "reward" else f"{v:.2f}"))
-        print(f"| `{task}` | " + " | ".join(cells) + " |")
+            if v is None:
+                cells.append("—")
+            elif k == "reward":
+                cells.append(f"**{v:.0f}**" if v == 1 else f"{v:.0f}")
+            else:
+                cells.append(f"{v * 100:.0f}%")
+        extra = ""
+        if "f2p_total" in d:
+            extra = f" {d.get('f2p_passed', 0):g}/{d.get('f2p_total', 0):g}"
+        print(f"| `{task}` | " + " | ".join(cells) + " |" + f"{extra} |")
     print()
     print("> 口径：每任务 1 rollout；缺失 reward 记为 0（超时/基础设施错误计失败）；")
     print("> harness = pier + mini-swe-agent(pinned)；与官方 58.7 对比时须注明自部署 NVFP4 / LLMRouter / 上下文配置差异。")
