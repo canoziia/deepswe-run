@@ -19,8 +19,8 @@ on:
         description: "并行 job 数（后端只有 2 卡，建议 4）"
         default: "4"
       model_name:
-        description: "传给 pier 的模型名"
-        default: hosted_vllm/qwen3.8-flash-next
+        description: "传给 pier 的模型名（provider/model）"
+        default: openai/qwen3.8-flash-next
       api_base:
         description: "OpenAI 兼容 base_url"
         default: https://llmrouter.projectk.org/v1
@@ -132,15 +132,21 @@ jobs:
           MODEL_NAME: ${{ inputs.model_name }}
           API_BASE: ${{ inputs.api_base }}
         run: |
+          # mini-swe-agent 的配置是嵌套的 model:/agent:，pier 用 -c 点号覆盖合并。
+          # cost_tracking: ignore_errors —— 自部署模型名不在 litellm 价格表里，否则会报错。
+          # top_k 走 extra_body（vLLM 专有参数，避免 litellm 因“不支持”而丢弃）。
           cat > mswea-qwen.yaml <<YAML
-          model_class: litellm
-          model_name: ${MODEL_NAME}
-          model_kwargs:
-            api_base: ${API_BASE}
-            temperature: 1.0
-            top_p: 0.95
-            top_k: 20
-            max_tokens: 32768
+          model:
+            model_class: litellm
+            model_name: ${MODEL_NAME}
+            model_kwargs:
+              api_base: ${API_BASE}
+              temperature: 1.0
+              top_p: 0.95
+              max_tokens: 32768
+              extra_body:
+                top_k: 20
+            cost_tracking: ignore_errors
           YAML
           sed -n '1,20p' mswea-qwen.yaml
 
@@ -160,14 +166,16 @@ jobs:
           HOSTED_VLLM_API_KEY: ${{ secrets.LLMROUTER_API_KEY }}
           API_BASE: ${{ inputs.api_base }}
         run: |
+          # --agent-env 必须是 KEY=VALUE（pier 的 parse_env_vars 会校验）
           .venv/bin/pier run -p "deep-swe/tasks/${{ matrix.task }}" \
             --agent mini-swe-agent \
             --model "${{ inputs.model_name }}" \
             --ak version=${{ inputs.mini_swe_agent_version }} \
+            --ak model_class=litellm \
             --ak config_file="$PWD/mswea-qwen.yaml" \
-            --ae OPENAI_API_KEY \
-            --ae HOSTED_VLLM_API_KEY \
-            --ae OPENAI_BASE_URL="$API_BASE" \
+            --ae "OPENAI_API_KEY=$OPENAI_API_KEY" \
+            --ae "HOSTED_VLLM_API_KEY=$HOSTED_VLLM_API_KEY" \
+            --ae "OPENAI_BASE_URL=$API_BASE" \
             --env docker -y -n 1 -r 1 \
             --agent-timeout-multiplier ${{ inputs.agent_timeout_multiplier }} \
             -o jobs
